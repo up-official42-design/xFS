@@ -1,4 +1,5 @@
 use crate::{MetaStore, Node, Inode};
+use std::collections::HashMap;
 use crate::helpers::{CHUNK_SIZE, store_chunk, load_chunk, cleanup_unused_chunks};
 use fuser::{
     FileAttr, FileHandle, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty,
@@ -279,6 +280,46 @@ impl Filesystem for XFS {
             accessed_at: now,
             chunks: Vec::new(),
         });
+
+        store.structure.insert(next_inode, inode);
+
+        if let Some(Node::Directory { entries, .. }) = store.structure.get_mut(&parent.0) {
+            entries.insert(name_str.to_string(), next_inode);
+        }
+
+        if let Some(node) = store.structure.get(&next_inode) {
+            reply.entry(&TTL, &self.make_attr(INodeNo(next_inode), node), fuser::Generation(0));
+        } else {
+            reply.error(Errno::EIO);
+        }
+    }
+
+    fn mkdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, _mode: u32, _umask: u32, reply: ReplyEntry) {
+        let name_str = name.to_str().unwrap_or("");
+        let mut store = self.state.write().unwrap();
+
+        if let Some(Node::Directory { entries, .. }) = store.structure.get(&parent.0)
+            && entries.contains_key(name_str)
+        {
+            reply.error(Errno::EEXIST);
+            return;
+        }
+
+        let next_inode = store.structure.keys().max().unwrap_or(&0) + 1;
+        let now = chrono::Utc::now().timestamp() as u64;
+
+        let inode = Node::Directory {
+            inode: Inode {
+                size: 0,
+                nlink: 2,
+                permissions: 0o755,
+                created_at: now,
+                modified_at: now,
+                accessed_at: now,
+                chunks: Vec::new(),
+            },
+            entries: HashMap::new(),
+        };
 
         store.structure.insert(next_inode, inode);
 
