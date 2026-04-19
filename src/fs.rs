@@ -40,8 +40,8 @@ impl XFS {
             },
             perm: i.permissions as u16,
             nlink: i.nlink,
-            uid: 0,
-            gid: 0,
+            uid: i.uid,
+            gid: i.gid,
             rdev: 0,
             blksize: 512,
             flags: 0,
@@ -65,8 +65,8 @@ impl Filesystem for XFS {
         _req: &Request,
         ino: INodeNo,
         mode: Option<u32>,
-        _uid: Option<u32>,
-        _gid: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
         size: Option<u64>,
         _atime: Option<TimeOrNow>,
         mtime: Option<TimeOrNow>,
@@ -109,6 +109,22 @@ impl Filesystem for XFS {
                     Node::File(inode) => inode.permissions = mode_val,
                     Node::Directory { inode, .. } => inode.permissions = mode_val,
                     Node::Symlink { inode, .. } => inode.permissions = mode_val,
+                }
+            }
+
+            if let Some(uid_val) = uid {
+                match node {
+                    Node::File(inode) => inode.uid = uid_val,
+                    Node::Directory { inode, .. } => inode.uid = uid_val,
+                    Node::Symlink { inode, .. } => inode.uid = uid_val,
+                }
+            }
+
+            if let Some(gid_val) = gid {
+                match node {
+                    Node::File(inode) => inode.gid = gid_val,
+                    Node::Directory { inode, .. } => inode.gid = gid_val,
+                    Node::Symlink { inode, .. } => inode.gid = gid_val,
                 }
             }
 
@@ -296,6 +312,8 @@ impl Filesystem for XFS {
             size: 0,
             nlink: 1,
             permissions: 0o644,
+            uid: _req.uid(),
+            gid: _req.gid(),
             created_at: now,
             modified_at: now,
             accessed_at: now,
@@ -333,6 +351,8 @@ impl Filesystem for XFS {
             size: 0,
             nlink: 1,
             permissions: 0o644,
+            uid: _req.uid(),
+            gid: _req.gid(),
             created_at: now,
             modified_at: now,
             accessed_at: now,
@@ -371,6 +391,8 @@ impl Filesystem for XFS {
                 size: 0,
                 nlink: 2,
                 permissions: 0o755,
+                uid: _req.uid(),
+                gid: _req.gid(),
                 created_at: now,
                 modified_at: now,
                 accessed_at: now,

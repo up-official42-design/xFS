@@ -69,6 +69,13 @@ pub fn file_setup() {
         fs::create_dir_all("/etc/xfs").expect("Failed to create dir");
     }
 
+    // Restrict /etc/xfs to root only
+    let _ = std::process::Command::new("sudo")
+        .arg("chmod")
+        .arg("700")
+        .arg("/etc/xfs")
+        .status();
+
     if !Path::new("/etc/xfs/meta.json").is_file() {
         if Path::new("/etc/xfs/meta.json").is_dir() {
             fs::remove_dir_all("/etc/xfs/meta.json").expect("Failed to remove dir");
