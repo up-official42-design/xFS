@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use crate::helpers::{CHUNK_SIZE, store_chunk, load_chunk, cleanup_unused_chunks};
 use fuser::{
     FileAttr, FileHandle, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, Request, INodeNo, Errno, LockOwner, OpenFlags,
+    ReplyEntry, Request, INodeNo, Errno, LockOwner, OpenFlags, TimeOrNow, BsdFileFlags, RenameFlags,
 };
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, UNIX_EPOCH};
@@ -54,6 +54,64 @@ impl Filesystem for XFS {
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
         let store = self.state.read().unwrap();
         if let Some(node) = store.structure.get(&ino.0) { // ino.0 extracts the u64
+            reply.attr(&TTL, &self.make_attr(ino, node));
+        } else {
+            reply.error(Errno::ENOENT);
+        }
+    }
+
+    fn setattr(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        mode: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+        size: Option<u64>,
+        _atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
+        _ctime: Option<std::time::SystemTime>,
+        _fh: Option<FileHandle>,
+        _crtime: Option<std::time::SystemTime>,
+        _chgtime: Option<std::time::SystemTime>,
+        _bkuptime: Option<std::time::SystemTime>,
+        _flags: Option<BsdFileFlags>,
+        reply: ReplyAttr,
+    ) {
+        let mut store = self.state.write().unwrap();
+
+        if let Some(node) = store.structure.get_mut(&ino.0) {
+            if let Some(new_size) = size {
+                if let Node::File(inode) = node {
+                    inode.size = new_size;
+                }
+            }
+
+            if let Some(mtime_val) = mtime {
+                let now = chrono::Utc::now().timestamp() as u64;
+                let mtime_secs = match mtime_val {
+                    TimeOrNow::SpecificTime(t) => {
+                        t.duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_secs() as u64)
+                            .unwrap_or(now)
+                    }
+                    TimeOrNow::Now => now,
+                };
+                match node {
+                    Node::File(inode) => inode.modified_at = mtime_secs,
+                    Node::Directory { inode, .. } => inode.modified_at = mtime_secs,
+                    Node::Symlink { inode, .. } => inode.modified_at = mtime_secs,
+                }
+            }
+
+            if let Some(mode_val) = mode {
+                match node {
+                    Node::File(inode) => inode.permissions = mode_val,
+                    Node::Directory { inode, .. } => inode.permissions = mode_val,
+                    Node::Symlink { inode, .. } => inode.permissions = mode_val,
+                }
+            }
+
             reply.attr(&TTL, &self.make_attr(ino, node));
         } else {
             reply.error(Errno::ENOENT);
@@ -341,6 +399,50 @@ impl Filesystem for XFS {
         } else {
             reply.error(Errno::EINVAL);
         }
+    }
+
+    fn rename(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        newparent: INodeNo,
+        newname: &OsStr,
+        _flags: RenameFlags,
+        reply: ReplyEmpty,
+    ) {
+        let name_str = name.to_str().unwrap_or("");
+        let newname_str = newname.to_str().unwrap_or("");
+        let mut store = self.state.write().unwrap();
+
+        let ino = if let Some(Node::Directory { entries, .. }) = store.structure.get(&parent.0) {
+            if let Some(&ino) = entries.get(name_str) {
+                ino
+            } else {
+                reply.error(Errno::ENOENT);
+                return;
+            }
+        } else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+
+        if let Some(Node::Directory { entries, .. }) = store.structure.get(&newparent.0) {
+            if entries.contains_key(newname_str) {
+                reply.error(Errno::EEXIST);
+                return;
+            }
+        }
+
+        if let Some(Node::Directory { entries, .. }) = store.structure.get_mut(&parent.0) {
+            entries.remove(name_str);
+        }
+
+        if let Some(Node::Directory { entries, .. }) = store.structure.get_mut(&newparent.0) {
+            entries.insert(newname_str.to_string(), ino);
+        }
+
+        reply.ok();
     }
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
