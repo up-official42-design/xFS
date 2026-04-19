@@ -1,8 +1,8 @@
 use crate::{MetaStore, Node, Inode};
 use crate::helpers::{CHUNK_SIZE, store_chunk, load_chunk};
 use fuser::{
-    FileAttr, FileHandle, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
-    Request, INodeNo, Errno, LockOwner, OpenFlags,
+    FileAttr, FileHandle, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty,
+    ReplyEntry, Request, INodeNo, Errno, LockOwner, OpenFlags,
 };
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, UNIX_EPOCH};
@@ -300,5 +300,65 @@ impl Filesystem for XFS {
         } else {
             reply.error(Errno::EINVAL);
         }
+    }
+
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let name_str = name.to_str().unwrap_or("");
+        let mut store = self.state.write().unwrap();
+
+        let ino = if let Some(Node::Directory { entries, .. }) = store.structure.get(&parent.0) {
+            if let Some(&ino) = entries.get(name_str) {
+                ino
+            } else {
+                reply.error(Errno::ENOENT);
+                return;
+            }
+        } else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+
+        store.structure.remove(&ino);
+
+        if let Some(Node::Directory { entries, .. }) = store.structure.get_mut(&parent.0) {
+            entries.remove(name_str);
+        }
+
+        reply.ok();
+    }
+
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let name_str = name.to_str().unwrap_or("");
+        let mut store = self.state.write().unwrap();
+
+        let ino = if let Some(Node::Directory { entries, .. }) = store.structure.get(&parent.0) {
+            if let Some(&ino) = entries.get(name_str) {
+                ino
+            } else {
+                reply.error(Errno::ENOENT);
+                return;
+            }
+        } else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+
+        if let Some(Node::Directory { entries, .. }) = store.structure.get(&ino) {
+            if !entries.is_empty() {
+                reply.error(Errno::ENOTEMPTY);
+                return;
+            }
+        } else {
+            reply.error(Errno::ENOTDIR);
+            return;
+        }
+
+        store.structure.remove(&ino);
+
+        if let Some(Node::Directory { entries, .. }) = store.structure.get_mut(&parent.0) {
+            entries.remove(name_str);
+        }
+
+        reply.ok();
     }
 }

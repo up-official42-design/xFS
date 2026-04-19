@@ -60,35 +60,35 @@ pub fn is_root() -> bool {
 pub const CHUNK_SIZE: usize = 512 * 1024; // 512 KB
 
 pub fn file_setup() {
-    if Path::new("/etc/xfs").is_file() {
-        fs::remove_file(Path::new("/etc/xfs")).expect("Failed to remove file");
-    }
-    if !Path::new("/etc/xfs").exists() {
+    if !Path::new("/etc/xfs").is_dir() {
+        if Path::new("/etc/xfs").exists() {
+            fs::remove_file(Path::new("/etc/xfs")).expect("Failed to remove file");
+        }
         fs::create_dir_all("/etc/xfs").expect("Failed to create dir");
     }
 
-    if Path::new("/etc/xfs/meta.json").is_dir() {
-        fs::remove_dir_all("/etc/xfs/meta.json").expect("Failed to remove dir");
-    }
-    if !Path::new("/etc/xfs/meta.json").exists() {
+    if !Path::new("/etc/xfs/meta.json").is_file() {
+        if Path::new("/etc/xfs/meta.json").exists() {
+            fs::remove_file("/etc/xfs/meta.json").expect("Failed to remove file");
+        }
         let file = fs::File::create("/etc/xfs/meta.json").expect("Failed to create metastore file");
         file.write_at(b"{}", 0)
             .expect("Failed to write meta.json file");
     }
 
     // Chunk storage directory - stored in /etc/xfs/store
-    if Path::new("/etc/xfs/store").is_file() {
-        fs::remove_file("/etc/xfs/store").expect("Failed to remove file");
-    }
-    if !Path::new("/etc/xfs/store").exists() {
+    if !Path::new("/etc/xfs/store").is_dir() {
+        if Path::new("/etc/xfs/store").exists() {
+            fs::remove_file("/etc/xfs/store").expect("Failed to remove file");
+        }
         fs::create_dir_all("/etc/xfs/store").expect("Failed to create chunks dir");
     }
 
     // Mountpoint directory
-    if Path::new("/mnt/xfs").is_file() {
-        fs::remove_file("/mnt/xfs").expect("Failed to remove file");
-    }
-    if !Path::new("/mnt/xfs").exists() {
+    if !Path::new("/mnt/xfs").is_dir() {
+        if Path::new("/mnt/xfs").exists() {
+            fs::remove_file("/mnt/xfs").expect("Failed to remove file");
+        }
         fs::create_dir_all("/mnt/xfs").expect("Failed to create mountpoint dir");
     }
 }
