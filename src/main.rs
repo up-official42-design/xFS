@@ -1,8 +1,9 @@
 pub mod fs;
 pub mod helpers;
 
-use crate::helpers::{file_setup, is_root, load_metastore, save_metastore};
+use crate::helpers::{file_setup, is_root, load_metastore, save_metastore, cleanup_unused_chunks, set_metastore_for_gc, start_gc_thread};
 use std::collections::HashMap;
+use std::process::Command;
 use fuser::{MountOption, Config};
 
 pub type InodeId = u64;
@@ -44,6 +45,16 @@ pub struct MetaStore {
     pub chunks: HashMap<Hash, Chunk>,
 }
 
+fn cleanup_mount_point(path: &str) {
+    // We don't really care if this fails (e.g., if the path isn't mounted),
+    // so we just fire and forget.
+    let _ = Command::new("sudo")
+        .arg("umount")
+        .arg("-l")
+        .arg(path)
+        .status();
+}
+
 fn main() {
     if !is_root() {
         eprintln!("Error: xFS requires root privileges for mounting.");
@@ -54,6 +65,16 @@ fn main() {
     println!("--- Welcome to xFS ---");
 
     let metastore = load_metastore();
+
+    // Cleanup unused chunks on startup
+    {
+        let store = metastore.read().unwrap();
+        cleanup_unused_chunks(&store);
+    }
+
+    // Spawn GC thread
+    set_metastore_for_gc(metastore.clone());
+    start_gc_thread();
 
     // Genesis: Ensure Inode 1 exists (Root)
     {
@@ -94,6 +115,8 @@ fn main() {
     let filesystem = fs::XFS {
         state: metastore,
     };
+
+    cleanup_mount_point(mountpoint);
 
     // Fuser 0.17.0 mount2
     fuser::mount2(filesystem, mountpoint, &config).expect("Failed to mount filesystem");

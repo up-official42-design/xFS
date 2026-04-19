@@ -1,5 +1,5 @@
 use crate::{MetaStore, Node, Inode};
-use crate::helpers::{CHUNK_SIZE, store_chunk, load_chunk};
+use crate::helpers::{CHUNK_SIZE, store_chunk, load_chunk, cleanup_unused_chunks};
 use fuser::{
     FileAttr, FileHandle, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty,
     ReplyEntry, Request, INodeNo, Errno, LockOwner, OpenFlags,
@@ -323,6 +323,8 @@ impl Filesystem for XFS {
         if let Some(Node::Directory { entries, .. }) = store.structure.get_mut(&parent.0) {
             entries.remove(name_str);
         }
+
+        cleanup_unused_chunks(&store);
 
         reply.ok();
     }
