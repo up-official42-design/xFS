@@ -258,7 +258,19 @@ pub fn rebuild_chunk_nlink(metastore: &mut MetaStore) {
 }
 
 pub fn load_metastore() -> Arc<RwLock<MetaStore>> {
-    let data = fs::read_to_string("/etc/xfs/meta.json").expect("Failed to read metastore file");
+    let data = match fs::read_to_string("/etc/xfs/meta.json") {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Error reading meta.json: {}, attempting recovery", e);
+            // Try to read from backup if main file is corrupted
+            if Path::new("/etc/xfs/meta.json.bak").exists() {
+                fs::read_to_string("/etc/xfs/meta.json.bak").unwrap_or_else(|_| "{}".to_string())
+            } else {
+                "{}".to_string()
+            }
+        }
+    };
+
     match serde_json::from_str::<MetaStore>(&data) {
         Ok(mut metastore) => {
             // Ensure next_inode is at least max existing inode + 1
@@ -269,11 +281,33 @@ pub fn load_metastore() -> Arc<RwLock<MetaStore>> {
             rebuild_chunk_nlink(&mut metastore);
             Arc::new(RwLock::new(metastore))
         }
-        Err(_) => Arc::new(RwLock::new(MetaStore {
-            structure: HashMap::new(),
-            chunks: HashMap::new(),
-            next_inode: 2, // Start from 2, reserving 1 for root
-        })),
+        Err(e) => {
+            eprintln!("Error parsing meta.json: {}, attempting backup", e);
+            // Try backup file
+            let backup_data = fs::read_to_string("/etc/xfs/meta.json.bak")
+                .map_err(|e| eprintln!("Backup also failed: {}", e))
+                .ok();
+
+            if let Some(backup_data) = backup_data {
+                if let Ok(mut metastore) = serde_json::from_str::<MetaStore>(&backup_data) {
+                    let max_inode = metastore.structure.keys().max().copied().unwrap_or(0);
+                    if metastore.next_inode <= max_inode {
+                        metastore.next_inode = max_inode + 1;
+                    }
+                    rebuild_chunk_nlink(&mut metastore);
+                    return Arc::new(RwLock::new(metastore));
+                }
+            }
+
+            // Last resort: return empty store but don't destroy data
+            eprintln!("WARNING: Could not parse meta.json, starting with empty filesystem");
+            eprintln!("The filesystem data may be recoverable from /etc/xfs/store/");
+            Arc::new(RwLock::new(MetaStore {
+                structure: HashMap::new(),
+                chunks: HashMap::new(),
+                next_inode: 2,
+            }))
+        }
     }
 }
 #[derive(Debug)]
@@ -290,7 +324,15 @@ pub fn save_metastore(metastore: Arc<RwLock<MetaStore>>) -> Result<(), MetaStore
 
     let json = serde_json::to_string(&*data).map_err(MetaStoreSaveError::SerializationError)?;
 
-    fs::write("/etc/xfs/meta.json", json.as_bytes()).map_err(MetaStoreSaveError::IO)?;
+    // Create backup before writing
+    if Path::new("/etc/xfs/meta.json").exists() {
+        let _ = fs::copy("/etc/xfs/meta.json", "/etc/xfs/meta.json.bak");
+    }
+
+    // Write atomically using rename
+    let temp_path = "/etc/xfs/meta.json.tmp";
+    fs::write(temp_path, json.as_bytes()).map_err(MetaStoreSaveError::IO)?;
+    fs::rename(temp_path, "/etc/xfs/meta.json").map_err(MetaStoreSaveError::IO)?;
 
     Ok(())
 }
