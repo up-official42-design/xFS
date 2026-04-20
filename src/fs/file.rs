@@ -235,7 +235,6 @@ pub fn handle_create(
     let new_ino = store.next_inode;
     store.next_inode += 1;
 
-    // Default file permissions: 644, apply umask normally
     let perm = if mode == 0 { 0o644 & !umask } else { mode & !umask };
 
     let inode = Node::File(Inode {
@@ -307,7 +306,6 @@ pub fn handle_mknod(
     let new_ino = store.next_inode;
     store.next_inode += 1;
 
-    // Default file permissions: 644, apply umask normally
     let perm = if mode == 0 { 0o644 & !umask } else { mode & !umask };
 
     let inode = Node::File(Inode {
@@ -335,11 +333,7 @@ pub fn handle_mknod(
     }
 
     if let Some(node) = store.structure.get(&new_ino) {
-        reply.entry(
-            &TTL,
-            &make_attr(INodeNo(new_ino), node),
-            fuser::Generation(0),
-        );
+        reply.entry(&TTL, &make_attr(INodeNo(new_ino), node), fuser::Generation(0));
     } else {
         reply.error(Errno::EIO);
     }
