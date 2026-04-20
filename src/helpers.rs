@@ -1,4 +1,4 @@
-use crate::{MetaStore, Hash, Node};
+use crate::{Chunk, Hash, MetaStore, Node};
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::fs;
@@ -8,44 +8,89 @@ use std::sync::{Arc, OnceLock, RwLock};
 use std::thread;
 use std::time::Duration;
 
+const ZERO_HASH: Hash = [0u8; 32];
+
 pub const CACHE_SIZE_BYTES: usize = 8 * 1024 * 1024 * 1024; // 8 GB
 pub const DECOMPRESSED_CHUNK_SIZE: usize = 512 * 1024; // 512 KB decompressed
 
-#[derive(Default)]
 pub struct ChunkCache {
-    cache: VecDeque<(Hash, Vec<u8>)>,
+    order: VecDeque<Hash>,
+    map: HashMap<Hash, Vec<u8>>,
+    positions: HashMap<Hash, u64>,
+    current_gen: u64,
     size_bytes: usize,
+}
+
+impl Default for ChunkCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ChunkCache {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            order: VecDeque::new(),
+            map: HashMap::new(),
+            positions: HashMap::new(),
+            current_gen: 0,
+            size_bytes: 0,
+        }
     }
 
     pub fn get(&mut self, hash: &[u8; 32]) -> Option<Vec<u8>> {
-        if let Some(pos) = self.cache.iter().position(|(h, _)| *h == *hash) {
-            let (_, data) = self.cache.remove(pos).unwrap();
-            return Some(data);
+        if self.positions.get(hash).copied().is_some() {
+            self.positions.insert(*hash, self.current_gen);
+            self.current_gen = self.current_gen.wrapping_add(1);
+            return self.map.get(hash).cloned();
         }
         None
     }
 
+    fn evict_one(&mut self) -> bool {
+        while let Some(old_hash) = self.order.pop_front() {
+            if self.positions.contains_key(&old_hash) {
+                if let Some(old_data) = self.map.remove(&old_hash) {
+                    self.size_bytes -= old_data.len();
+                }
+                self.positions.remove(&old_hash);
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn put(&mut self, hash: Hash, data: Vec<u8>) {
         let data_size = data.len();
+
+        if let Some(old) = self.map.remove(&hash) {
+            self.size_bytes -= old.len();
+        }
+
         while self.size_bytes + data_size > CACHE_SIZE_BYTES {
-            if let Some((_, removed)) = self.cache.pop_front() {
-                self.size_bytes -= removed.len();
-            } else {
+            if !self.evict_one() {
                 break;
             }
         }
-        self.cache.push_back((hash, data));
+
+        self.positions.insert(hash, self.current_gen);
+        self.current_gen = self.current_gen.wrapping_add(1);
+        self.order.push_back(hash);
+
+        self.map.insert(hash, data);
         self.size_bytes += data_size;
     }
 
     pub fn clear(&mut self) {
-        self.cache.clear();
+        self.order.clear();
+        self.map.clear();
+        self.positions.clear();
+        self.current_gen = 0;
         self.size_bytes = 0;
+    }
+
+    pub fn contains(&self, hash: &Hash) -> bool {
+        self.map.contains_key(hash)
     }
 }
 
@@ -70,11 +115,14 @@ pub fn file_setup() {
     }
 
     // Restrict /etc/xfs to root only
-    let _ = std::process::Command::new("sudo")
+    if let Err(e) = std::process::Command::new("sudo")
         .arg("chmod")
         .arg("700")
         .arg("/etc/xfs")
-        .status();
+        .status()
+    {
+        eprintln!("Warning: Failed to chmod /etc/xfs: {}", e);
+    }
 
     if !Path::new("/etc/xfs/meta.json").is_file() {
         if Path::new("/etc/xfs/meta.json").is_dir() {
@@ -91,6 +139,22 @@ pub fn file_setup() {
             fs::remove_file("/etc/xfs/store").expect("Failed to remove file");
         }
         fs::create_dir_all("/etc/xfs/store").expect("Failed to create chunks dir");
+    }
+
+    // Mountpoint directory - must be world-accessible
+    if !Path::new("/mnt/xfs").is_dir() {
+        if Path::new("/mnt/xfs").exists() {
+            fs::remove_file("/mnt/xfs").expect("Failed to remove file");
+        }
+        fs::create_dir_all("/mnt/xfs").expect("Failed to create mountpoint dir");
+    }
+    if let Err(e) = std::process::Command::new("sudo")
+        .arg("chmod")
+        .arg("755")
+        .arg("/mnt/xfs")
+        .status()
+    {
+        eprintln!("Warning: Failed to chmod /mnt/xfs: {}", e);
     }
 }
 
@@ -150,6 +214,27 @@ pub fn chunk_exists(hash: &[u8; 32]) -> bool {
     get_chunk_path(hash).exists()
 }
 
+/// Increment reference count for a chunk
+pub fn inc_chunk_ref(metastore: &mut MetaStore, hash: Hash) {
+    metastore
+        .chunks
+        .entry(hash)
+        .and_modify(|c| c.nlink += 1)
+        .or_insert(Chunk { hash, nlink: 1 });
+}
+
+/// Decrement reference count for a chunk, returns true if chunk is no longer referenced
+pub fn dec_chunk_ref(metastore: &mut MetaStore, hash: &Hash) -> bool {
+    if let Some(chunk) = metastore.chunks.get_mut(hash) {
+        chunk.nlink = chunk.nlink.saturating_sub(1);
+        if chunk.nlink == 0 {
+            metastore.chunks.remove(hash);
+            return true;
+        }
+    }
+    false
+}
+
 pub fn collect_used_chunks(metastore: &MetaStore) -> std::collections::HashSet<Hash> {
     let mut used = std::collections::HashSet::new();
     for node in metastore.structure.values() {
@@ -172,26 +257,26 @@ pub fn collect_stored_chunks() -> std::collections::HashSet<Hash> {
     if let Ok(entries) = fs::read_dir(store_path) {
         for entry in entries.flatten() {
             let subdir_path = entry.path();
-            if subdir_path.is_dir() {
-                if let Ok(subdir_entries) = fs::read_dir(&subdir_path) {
-                    for file in subdir_entries.flatten() {
-                        let path = file.path();
-                        if path.is_file() {
-                            if let Some(name) = path.file_name() {
-                                let name_str = match name.to_str() {
-                                    Some(s) => s,
-                                    None => continue,
-                                };
-                                let hex = match hex::decode(name_str) {
-                                    Ok(h) => h,
-                                    Err(_) => continue,
-                                };
-                                if hex.len() == 32 {
-                                    let mut hash = [0u8; 32];
-                                    hash.copy_from_slice(&hex);
-                                    stored.insert(hash);
-                                }
-                            }
+            if subdir_path.is_dir()
+                && let Ok(subdir_entries) = fs::read_dir(&subdir_path)
+            {
+                for file in subdir_entries.flatten() {
+                    let path = file.path();
+                    if path.is_file()
+                        && let Some(name) = path.file_name()
+                    {
+                        let name_str = match name.to_str() {
+                            Some(s) => s,
+                            None => continue,
+                        };
+                        let hex = match hex::decode(name_str) {
+                            Ok(h) => h,
+                            Err(_) => continue,
+                        };
+                        if hex.len() == 32 {
+                            let mut hash = [0u8; 32];
+                            hash.copy_from_slice(&hex);
+                            stored.insert(hash);
                         }
                     }
                 }
@@ -202,13 +287,19 @@ pub fn collect_stored_chunks() -> std::collections::HashSet<Hash> {
 }
 
 pub fn cleanup_unused_chunks(metastore: &MetaStore) {
-    let used = collect_used_chunks(metastore);
     let stored = collect_stored_chunks();
 
-    for hash in stored.difference(&used) {
-        let path = get_chunk_path(hash);
-        if path.exists() {
-            if let Err(e) = fs::remove_file(&path) {
+    for hash in &stored {
+        let should_delete = match metastore.chunks.get(hash) {
+            Some(chunk) => chunk.nlink == 0,
+            None => true,
+        };
+
+        if should_delete {
+            let path = get_chunk_path(hash);
+            if path.exists()
+                && let Err(e) = fs::remove_file(&path)
+            {
                 eprintln!("Failed to remove unused chunk {:?}: {}", hash, e);
             }
         }
@@ -234,13 +325,38 @@ pub fn start_gc_thread() {
     });
 }
 
+pub fn rebuild_chunk_nlink(metastore: &mut MetaStore) {
+    let mut hashes_to_inc: Vec<Hash> = Vec::new();
+    for node in metastore.structure.values() {
+        if let Node::File(inode) = node {
+            for hash in &inode.chunks {
+                if *hash != ZERO_HASH {
+                    hashes_to_inc.push(*hash);
+                }
+            }
+        }
+    }
+    for hash in hashes_to_inc {
+        inc_chunk_ref(metastore, hash);
+    }
+}
+
 pub fn load_metastore() -> Arc<RwLock<MetaStore>> {
     let data = fs::read_to_string("/etc/xfs/meta.json").expect("Failed to read metastore file");
     match serde_json::from_str::<MetaStore>(&data) {
-        Ok(metastore) => Arc::new(RwLock::new(metastore)),
+        Ok(mut metastore) => {
+            // Ensure next_inode is at least max existing inode + 1
+            let max_inode = metastore.structure.keys().max().copied().unwrap_or(0);
+            if metastore.next_inode <= max_inode {
+                metastore.next_inode = max_inode + 1;
+            }
+            rebuild_chunk_nlink(&mut metastore);
+            Arc::new(RwLock::new(metastore))
+        }
         Err(_) => Arc::new(RwLock::new(MetaStore {
             structure: HashMap::new(),
             chunks: HashMap::new(),
+            next_inode: 2, // Start from 2, reserving 1 for root
         })),
     }
 }
@@ -256,8 +372,7 @@ pub fn save_metastore(metastore: Arc<RwLock<MetaStore>>) -> Result<(), MetaStore
         return Err(MetaStoreSaveError::LockPoisonError);
     };
 
-    let json =
-        serde_json::to_string(&*data).map_err(MetaStoreSaveError::SerializationError)?;
+    let json = serde_json::to_string(&*data).map_err(MetaStoreSaveError::SerializationError)?;
 
     fs::write("/etc/xfs/meta.json", json.as_bytes()).map_err(MetaStoreSaveError::IO)?;
 
