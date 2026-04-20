@@ -1,23 +1,13 @@
 use super::TTL;
 use super::attr::make_attr;
 use crate::helpers::{CHUNK_SIZE, dec_chunk_ref, inc_chunk_ref, load_chunk, store_chunk};
+use crate::utils::{get_valid_name, now_ts};
 use crate::{Hash, Inode, MetaStore, Node};
 use fuser::{Errno, INodeNo, LockOwner, OpenFlags, ReplyData, ReplyEntry, Request};
 use sha2::{Digest, Sha256};
-use std::ffi::OsStr;
 use std::sync::{Arc, RwLock};
 
 const ZERO_HASH: Hash = [0u8; 32];
-
-fn get_valid_name(name: &OsStr) -> Option<String> {
-    name.to_str()
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-}
-
-fn now_ts() -> u64 {
-    chrono::Utc::now().timestamp() as u64
-}
 
 #[allow(clippy::too_many_arguments)]
 pub fn handle_read(
@@ -71,7 +61,8 @@ pub fn handle_read(
                             }
                         }
                         Err(_) => {
-                            data.extend(vec![0u8; bytes_from_chunk]);
+                            reply.error(Errno::EIO);
+                            return;
                         }
                     }
                 }
@@ -101,13 +92,13 @@ pub fn handle_write(
     _lock: Option<LockOwner>,
     reply: fuser::ReplyWrite,
 ) {
-    let mut store = state.write().unwrap();
+    // Phase 1: Read existing metadata (brief read lock)
+    let (first_chunk_idx, last_chunk_idx, write_end, chunks_clone) = {
+        let store = state.read().unwrap();
+        let write_end = offset + data.len() as u64;
+        let first_chunk_idx = (offset as usize) / CHUNK_SIZE;
+        let last_chunk_idx = (write_end as usize - 1) / CHUNK_SIZE;
 
-    let write_end = offset + data.len() as u64;
-    let first_chunk_idx = (offset as usize) / CHUNK_SIZE;
-    let last_chunk_idx = (write_end as usize - 1) / CHUNK_SIZE;
-
-    let chunks_clone = {
         let inode = match store.structure.get(&ino.0) {
             Some(Node::File(inode)) => inode,
             _ => {
@@ -115,12 +106,11 @@ pub fn handle_write(
                 return;
             }
         };
-        inode.chunks.clone()
+        (first_chunk_idx, last_chunk_idx, write_end, inode.chunks.clone())
     };
 
-    let mut chunk_ops: Vec<(usize, Hash)> = Vec::new();
-    let mut decref_list: Vec<Hash> = Vec::new();
-    let mut incref_list: Vec<Hash> = Vec::new();
+    // Phase 2: Build new chunk data (lock-free)
+    let mut chunk_preps: Vec<(usize, Vec<u8>, Hash)> = Vec::new();
 
     for chunk_idx in first_chunk_idx..=last_chunk_idx {
         let chunk_offset = chunk_idx * CHUNK_SIZE;
@@ -142,9 +132,7 @@ pub fn handle_write(
 
         let has_old_chunk = old_hash != ZERO_HASH && load_chunk(&old_hash).is_ok();
 
-        if has_old_chunk
-            && let Ok(existing_data) = load_chunk(&old_hash)
-        {
+        if has_old_chunk && let Ok(existing_data) = load_chunk(&old_hash) {
             let existing_len = existing_data.len().min(CHUNK_SIZE);
             new_chunk_data[..existing_len].copy_from_slice(&existing_data[..existing_len]);
         }
@@ -160,20 +148,14 @@ pub fn handle_write(
         }
 
         if is_zero_chunk || new_chunk_data.iter().all(|b| *b == 0) {
-            if has_old_chunk && old_hash != ZERO_HASH {
-                decref_list.push(old_hash);
-            }
-            chunk_ops.push((chunk_idx, ZERO_HASH));
+            chunk_preps.push((chunk_idx, vec![], ZERO_HASH));
             continue;
         }
 
+        // Hash and store chunk outside of any locks
         let mut hasher = Sha256::new();
         hasher.update(&new_chunk_data);
         let new_hash: Hash = hasher.finalize().into();
-
-        if has_old_chunk && old_hash != new_hash && old_hash != ZERO_HASH {
-            decref_list.push(old_hash);
-        }
 
         if let Err(e) = store_chunk(&new_hash, &new_chunk_data) {
             eprintln!("Error storing chunk: {:?}", e);
@@ -181,28 +163,39 @@ pub fn handle_write(
             return;
         }
 
-        incref_list.push(new_hash);
-        chunk_ops.push((chunk_idx, new_hash));
+        chunk_preps.push((chunk_idx, new_chunk_data, new_hash));
     }
 
-    for hash in decref_list {
-        dec_chunk_ref(&mut store, &hash);
-    }
-    for hash in incref_list {
-        inc_chunk_ref(&mut store, hash);
+    // Phase 3: Update metadata (write lock)
+    let mut store = state.write().unwrap();
+    let now = now_ts();
+
+    // Update chunk references
+    for (chunk_idx, _, new_hash) in &chunk_preps {
+        let old_hash = if *chunk_idx < chunks_clone.len() {
+            chunks_clone[*chunk_idx]
+        } else {
+            ZERO_HASH
+        };
+
+        if old_hash != ZERO_HASH && old_hash != *new_hash {
+            dec_chunk_ref(&mut store, &old_hash);
+        }
+        if *new_hash != ZERO_HASH && old_hash != *new_hash {
+            inc_chunk_ref(&mut store, *new_hash);
+        }
     }
 
     if let Some(Node::File(inode)) = store.structure.get_mut(&ino.0) {
         if inode.chunks.len() <= last_chunk_idx {
             inode.chunks.resize(last_chunk_idx + 1, ZERO_HASH);
         }
-        for (idx, hash) in chunk_ops {
+        for (idx, _, hash) in chunk_preps {
             inode.chunks[idx] = hash;
         }
         if write_end > inode.size {
             inode.size = write_end;
         }
-        let now = now_ts();
         inode.modified_at = now;
         inode.accessed_at = now;
     }
