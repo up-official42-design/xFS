@@ -92,7 +92,7 @@ pub fn handle_rename(
     name: &OsStr,
     newparent: INodeNo,
     newname: &OsStr,
-    _flags: RenameFlags,
+    flags: RenameFlags,
     reply: ReplyEmpty,
 ) {
     let Some(name_str) = get_valid_name(name) else {
@@ -140,6 +140,25 @@ pub fn handle_rename(
                 break;
             }
         }
+    }
+
+    // Check if target exists and handle rename flags
+    let target_exists = store.structure.get(&newparent.0)
+        .and_then(|node| match node {
+            Node::Directory { entries, .. } => entries.get(&newname_str).copied(),
+            _ => None,
+        })
+        .is_some();
+
+    if flags.contains(RenameFlags::NOREPLACE) && target_exists {
+        reply.error(Errno::EEXIST);
+        return;
+    }
+
+    // RENAME_EXCHANGE is not supported yet
+    if flags.contains(RenameFlags::EXCHANGE) {
+        reply.error(Errno::ENOSYS);
+        return;
     }
 
     let replace_info: Option<(u64, bool, u32)> = {
@@ -290,7 +309,8 @@ pub fn handle_symlink(
         return;
     };
 
-    let target_str = target.to_str().unwrap_or("").to_string();
+    // Use lossy conversion for non-UTF8 symlink targets (better than empty string)
+    let target_str = target.to_string_lossy().into_owned();
 
     let mut store = state.write().unwrap();
     let now = now_ts();

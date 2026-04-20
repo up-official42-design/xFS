@@ -1,8 +1,8 @@
 use crate::{Chunk, Hash, MetaStore, Node};
+pub use crate::fs::cache::{create_chunk_cache, SharedChunkCache, ChunkCacheManager, CACHE_SIZE_BYTES};
 use std::collections::HashMap;
-use std::collections::VecDeque;
 use std::fs;
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, PermissionsExt};
 use std::path::Path;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::thread;
@@ -10,94 +10,12 @@ use std::time::Duration;
 
 const ZERO_HASH: Hash = [0u8; 32];
 
-pub const CACHE_SIZE_BYTES: usize = 8 * 1024 * 1024 * 1024; // 8 GB
-pub const DECOMPRESSED_CHUNK_SIZE: usize = 512 * 1024; // 512 KB decompressed
+pub const DECOMPRESSED_CHUNK_SIZE: usize = 512 * 1024;
 
-pub struct ChunkCache {
-    order: VecDeque<Hash>,
-    map: HashMap<Hash, Vec<u8>>,
-    positions: HashMap<Hash, u64>,
-    current_gen: u64,
-    size_bytes: usize,
-}
+static CHUNK_CACHE: OnceLock<SharedChunkCache> = OnceLock::new();
 
-impl Default for ChunkCache {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ChunkCache {
-    pub fn new() -> Self {
-        Self {
-            order: VecDeque::new(),
-            map: HashMap::new(),
-            positions: HashMap::new(),
-            current_gen: 0,
-            size_bytes: 0,
-        }
-    }
-
-    pub fn get(&mut self, hash: &[u8; 32]) -> Option<Vec<u8>> {
-        if self.positions.get(hash).copied().is_some() {
-            self.positions.insert(*hash, self.current_gen);
-            self.current_gen = self.current_gen.wrapping_add(1);
-            return self.map.get(hash).cloned();
-        }
-        None
-    }
-
-    fn evict_one(&mut self) -> bool {
-        while let Some(old_hash) = self.order.pop_front() {
-            if self.positions.contains_key(&old_hash) {
-                if let Some(old_data) = self.map.remove(&old_hash) {
-                    self.size_bytes -= old_data.len();
-                }
-                self.positions.remove(&old_hash);
-                return true;
-            }
-        }
-        false
-    }
-
-    pub fn put(&mut self, hash: Hash, data: Vec<u8>) {
-        let data_size = data.len();
-
-        if let Some(old) = self.map.remove(&hash) {
-            self.size_bytes -= old.len();
-        }
-
-        while self.size_bytes + data_size > CACHE_SIZE_BYTES {
-            if !self.evict_one() {
-                break;
-            }
-        }
-
-        self.positions.insert(hash, self.current_gen);
-        self.current_gen = self.current_gen.wrapping_add(1);
-        self.order.push_back(hash);
-
-        self.map.insert(hash, data);
-        self.size_bytes += data_size;
-    }
-
-    pub fn clear(&mut self) {
-        self.order.clear();
-        self.map.clear();
-        self.positions.clear();
-        self.current_gen = 0;
-        self.size_bytes = 0;
-    }
-
-    pub fn contains(&self, hash: &Hash) -> bool {
-        self.map.contains_key(hash)
-    }
-}
-
-static DECOMPRESSED_CHUNK_CACHE: OnceLock<RwLock<ChunkCache>> = OnceLock::new();
-
-pub fn get_chunk_cache() -> &'static RwLock<ChunkCache> {
-    DECOMPRESSED_CHUNK_CACHE.get_or_init(|| RwLock::new(ChunkCache::new()))
+pub fn get_chunk_cache() -> &'static SharedChunkCache {
+    CHUNK_CACHE.get_or_init(|| Arc::new(RwLock::new(ChunkCacheManager::new())))
 }
 
 pub fn is_root() -> bool {
@@ -114,13 +32,8 @@ pub fn file_setup() {
         fs::create_dir_all("/etc/xfs").expect("Failed to create dir");
     }
 
-    // Restrict /etc/xfs to root only
-    if let Err(e) = std::process::Command::new("sudo")
-        .arg("chmod")
-        .arg("700")
-        .arg("/etc/xfs")
-        .status()
-    {
+    // Restrict /etc/xfs to root only using native fs operations
+    if let Err(e) = fs::set_permissions("/etc/xfs", std::fs::Permissions::from_mode(0o700)) {
         eprintln!("Warning: Failed to chmod /etc/xfs: {}", e);
     }
 
@@ -148,12 +61,7 @@ pub fn file_setup() {
         }
         fs::create_dir_all("/mnt/xfs").expect("Failed to create mountpoint dir");
     }
-    if let Err(e) = std::process::Command::new("sudo")
-        .arg("chmod")
-        .arg("755")
-        .arg("/mnt/xfs")
-        .status()
-    {
+    if let Err(e) = fs::set_permissions("/mnt/xfs", std::fs::Permissions::from_mode(0o755)) {
         eprintln!("Warning: Failed to chmod /mnt/xfs: {}", e);
     }
 }
@@ -194,7 +102,7 @@ pub fn store_chunk(hash: &[u8; 32], data: &[u8]) -> Result<(), std::io::Error> {
 pub fn load_chunk(hash: &[u8; 32]) -> Result<Vec<u8>, std::io::Error> {
     let mut cache = get_chunk_cache().write().unwrap();
     if let Some(data) = cache.get(hash) {
-        return Ok(data);
+        return Ok(data.as_ref().to_vec());
     }
     drop(cache);
 
