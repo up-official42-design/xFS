@@ -1,10 +1,13 @@
 pub mod fs;
 pub mod helpers;
 
-use crate::helpers::{file_setup, is_root, load_metastore, save_metastore, cleanup_unused_chunks, set_metastore_for_gc, start_gc_thread};
+use crate::helpers::{
+    cleanup_unused_chunks, file_setup, is_root, load_metastore, save_metastore,
+    set_metastore_for_gc, start_gc_thread,
+};
+use fuser::{Config, MountOption, SessionACL};
 use std::collections::HashMap;
 use std::process::Command;
-use fuser::{MountOption, Config};
 
 pub type InodeId = u64;
 pub type Hash = [u8; 32];
@@ -45,6 +48,7 @@ pub struct Chunk {
 pub struct MetaStore {
     pub structure: HashMap<InodeId, Node>,
     pub chunks: HashMap<Hash, Chunk>,
+    pub next_inode: u64,
 }
 
 fn cleanup_mount_point(path: &str) {
@@ -68,23 +72,38 @@ fn main() {
 
     let metastore = load_metastore();
 
-    // Cleanup unused chunks on startup
+    // Cleanup unused chunks on startup (only if filesystem was previously initialized)
     {
         let store = metastore.read().unwrap();
-        cleanup_unused_chunks(&store);
+        if store.next_inode > 1 {
+            cleanup_unused_chunks(&store);
+        }
     }
 
     // Spawn GC thread
     set_metastore_for_gc(metastore.clone());
     start_gc_thread();
 
-    // Genesis: Ensure Inode 1 exists (Root)
-    {
+    // Genesis: Ensure Inode 1 exists (Root) and /home folder
+    let needs_save = {
         let mut lock = metastore.write().unwrap();
-        if let std::collections::hash_map::Entry::Vacant(e) = lock.structure.entry(1) {
+        let now = chrono::Utc::now().timestamp() as u64;
+
+        // Root directory (inode 1) with 755 for everyone to read
+        let created_root = !lock.structure.contains_key(&1);
+        if created_root {
             println!("Genesis: Creating root directory (Inode 1)...");
-            let now = chrono::Utc::now().timestamp() as u64;
-            e.insert(Node::Directory {
+            let mut entries = HashMap::new();
+            entries.insert(".".to_string(), 1);
+            entries.insert("..".to_string(), 1);
+
+            // /home directory
+            let home_inode = lock.next_inode;
+            lock.next_inode += 1;
+            let mut home_entries = HashMap::new();
+            home_entries.insert(".".to_string(), home_inode);
+            home_entries.insert("..".to_string(), 1);
+            lock.structure.insert(home_inode, Node::Directory {
                 inode: Inode {
                     size: 0,
                     nlink: 2,
@@ -96,11 +115,35 @@ fn main() {
                     accessed_at: now,
                     chunks: Vec::new(),
                 },
-                entries: HashMap::new(),
+                entries: home_entries,
             });
-            drop(lock);
-            save_metastore(metastore.clone()).expect("Failed to save initial metastore");
+            entries.insert("home".to_string(), home_inode);
+
+            lock.structure.insert(1, Node::Directory {
+                inode: Inode {
+                    size: 0,
+                    nlink: 2,
+                    permissions: 0o755,
+                    uid: 0,
+                    gid: 0,
+                    created_at: now,
+                    modified_at: now,
+                    accessed_at: now,
+                    chunks: Vec::new(),
+                },
+                entries,
+            });
         }
+
+        // Ensure next_inode is at least 2
+        if lock.next_inode <= 1 {
+            lock.next_inode = 2;
+        }
+        created_root
+    };
+
+    if needs_save {
+        save_metastore(metastore.clone()).expect("Failed to save initial metastore");
     }
 
     let mountpoint = "/mnt/xfs"; // Mount at /mnt/xfs
@@ -113,12 +156,11 @@ fn main() {
     // Config is non-exhaustive, need to use Default and modify via mutable reference
     let mut config = Config::default();
     config.mount_options = options;
+    config.acl = SessionACL::All; // Allow all users to access the filesystem
 
     println!("Mounting xFS at {}...", mountpoint);
 
-    let filesystem = fs::XFS {
-        state: metastore,
-    };
+    let filesystem = fs::XFS { state: metastore };
 
     cleanup_mount_point(mountpoint);
 
