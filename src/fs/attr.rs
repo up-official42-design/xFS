@@ -9,10 +9,24 @@ pub fn make_attr(ino: INodeNo, node: &Node) -> FileAttr {
         Node::Symlink { inode, .. } => inode,
     };
 
+    // For files, count actual allocated chunks instead of size/512
+    // This correctly handles sparse files
+    let blocks = match node {
+        Node::File(inode) => {
+            let non_zero_chunks = inode
+                .chunks
+                .iter()
+                .filter(|&&hash| hash != [0u8; 32])
+                .count();
+            (non_zero_chunks * 512 * 1024 / 512) as u64
+        }
+        _ => i.size.div_ceil(512),
+    };
+
     FileAttr {
         ino,
         size: i.size,
-        blocks: i.size.div_ceil(512),
+        blocks,
         atime: UNIX_EPOCH + Duration::from_secs(i.accessed_at),
         mtime: UNIX_EPOCH + Duration::from_secs(i.modified_at),
         ctime: UNIX_EPOCH + Duration::from_secs(i.created_at),

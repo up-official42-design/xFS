@@ -48,40 +48,50 @@ pub fn handle_readdir(
 ) {
     let store = state.read().unwrap();
     if let Some(Node::Directory { entries, .. }) = store.structure.get(&ino.0) {
-        let mut idx = 0u64;
+        // Use stable ordering by sorting entries
+        let mut sorted_entries: Vec<_> = entries.iter().collect();
+        sorted_entries.sort_by(|a, b| a.0.cmp(&b.0));
 
-        if idx >= offset {
-            if reply.add(INodeNo(ino.0), idx + 1, FileType::Directory, ".") {
+        let mut offset_idx = offset.saturating_sub(1) as usize;
+
+        // .
+        if offset == 0 || offset_idx < 1 {
+            if reply.add(INodeNo(ino.0), 1, FileType::Directory, ".") {
                 return reply.ok();
             }
         }
-        idx += 1;
 
-        let parent_ino = entries.get("..").copied().unwrap_or(1);
-        if idx >= offset {
-            if reply.add(INodeNo(parent_ino), idx + 1, FileType::Directory, "..") {
+        // ..
+        if offset <= 2 {
+            if offset_idx < 2 {
+                offset_idx = 2;
+            }
+            let parent_ino = entries.get("..").copied().unwrap_or(1);
+            if reply.add(INodeNo(parent_ino), 2, FileType::Directory, "..") {
                 return reply.ok();
             }
         }
-        idx += 1;
 
-        for (name, &child_ino) in entries.iter() {
+        for (name, &child_ino) in sorted_entries {
             if name == "." || name == ".." {
                 continue;
             }
-            if idx >= offset {
-                let node = store.structure.get(&child_ino);
-                let kind = match node {
-                    Some(Node::File(_)) => FileType::RegularFile,
-                    Some(Node::Symlink { .. }) => FileType::Symlink,
-                    Some(Node::Directory { .. }) => FileType::Directory,
-                    _ => FileType::RegularFile,
-                };
-                if reply.add(INodeNo(child_ino), idx + 1, kind, name) {
-                    return reply.ok();
-                }
+            let entry_offset = (offset_idx + 1) as u64;
+            if entry_offset < offset {
+                offset_idx += 1;
+                continue;
             }
-            idx += 1;
+            let node = store.structure.get(&child_ino);
+            let kind = match node {
+                Some(Node::File(_)) => FileType::RegularFile,
+                Some(Node::Symlink { .. }) => FileType::Symlink,
+                Some(Node::Directory { .. }) => FileType::Directory,
+                _ => FileType::RegularFile,
+            };
+            if reply.add(INodeNo(child_ino), entry_offset + 1, kind, name) {
+                return reply.ok();
+            }
+            offset_idx += 1;
         }
         reply.ok();
     } else {
