@@ -1,20 +1,10 @@
 use super::TTL;
 use super::attr::make_attr;
+use crate::utils::{get_valid_name, now_ts};
 use crate::{Inode, MetaStore, Node};
 use fuser::{Errno, FileType, INodeNo, ReplyDirectory, ReplyEmpty, ReplyEntry, Request};
 use std::collections::HashMap;
-use std::ffi::OsStr;
 use std::sync::{Arc, RwLock};
-
-fn get_valid_name(name: &OsStr) -> Option<String> {
-    name.to_str()
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-}
-
-fn now_ts() -> u64 {
-    chrono::Utc::now().timestamp() as u64
-}
 
 pub fn handle_lookup(
     state: &Arc<RwLock<MetaStore>>,
@@ -29,15 +19,20 @@ pub fn handle_lookup(
     };
     let store = state.read().unwrap();
 
-    if let Some(Node::Directory { entries, .. }) = store.structure.get(&parent.0)
-        && let Some(&ino_u64) = entries.get(&name_str)
-        && let Some(node) = store.structure.get(&ino_u64)
-    {
-        reply.entry(
-            &TTL,
-            &make_attr(INodeNo(ino_u64), node),
-            fuser::Generation(0),
-        );
+    if let Some(Node::Directory { entries, .. }) = store.structure.get(&parent.0) {
+        if let Some(&ino_u64) = entries.get(&name_str) {
+            if let Some(node) = store.structure.get(&ino_u64) {
+                reply.entry(
+                    &TTL,
+                    &make_attr(INodeNo(ino_u64), node),
+                    fuser::Generation(0),
+                );
+            } else {
+                reply.error(Errno::EIO);
+            }
+        } else {
+            reply.error(Errno::ENOENT);
+        }
     } else {
         reply.error(Errno::ENOENT);
     }
@@ -53,33 +48,40 @@ pub fn handle_readdir(
 ) {
     let store = state.read().unwrap();
     if let Some(Node::Directory { entries, .. }) = store.structure.get(&ino.0) {
-        let mut all_entries: Vec<(&str, u64, FileType)> = Vec::new();
+        let mut idx = 0u64;
 
-        all_entries.push((".", ino.0, FileType::Directory));
-        if let Some(parent_ino) = entries.get("..") {
-            all_entries.push(("..", *parent_ino, FileType::Directory));
-        } else {
-            all_entries.push(("..", 1, FileType::Directory));
+        if idx >= offset {
+            if reply.add(INodeNo(ino.0), idx + 1, FileType::Directory, ".") {
+                return reply.ok();
+            }
         }
+        idx += 1;
+
+        let parent_ino = entries.get("..").copied().unwrap_or(1);
+        if idx >= offset {
+            if reply.add(INodeNo(parent_ino), idx + 1, FileType::Directory, "..") {
+                return reply.ok();
+            }
+        }
+        idx += 1;
 
         for (name, &child_ino) in entries.iter() {
             if name == "." || name == ".." {
                 continue;
             }
-            let node = store.structure.get(&child_ino);
-            let kind = match node {
-                Some(Node::File(_)) => FileType::RegularFile,
-                Some(Node::Symlink { .. }) => FileType::Symlink,
-                Some(Node::Directory { .. }) => FileType::Directory,
-                _ => FileType::RegularFile,
-            };
-            all_entries.push((name, child_ino, kind));
-        }
-
-        for (i, (name, child_ino, kind)) in all_entries.iter().enumerate().skip(offset as usize) {
-            if reply.add(INodeNo(*child_ino), (i + 1) as u64, *kind, name) {
-                break;
+            if idx >= offset {
+                let node = store.structure.get(&child_ino);
+                let kind = match node {
+                    Some(Node::File(_)) => FileType::RegularFile,
+                    Some(Node::Symlink { .. }) => FileType::Symlink,
+                    Some(Node::Directory { .. }) => FileType::Directory,
+                    _ => FileType::RegularFile,
+                };
+                if reply.add(INodeNo(child_ino), idx + 1, kind, name) {
+                    return reply.ok();
+                }
             }
+            idx += 1;
         }
         reply.ok();
     } else {
@@ -121,25 +123,15 @@ pub fn handle_mkdir(
     entries.insert(".".to_string(), new_ino);
     entries.insert("..".to_string(), parent.0);
 
-    // Default directories: 755, apply umask if mode provided, otherwise use 755
-    let perm = if mode == 0 {
-        0o755 & !umask
-    } else {
-        (mode & !umask) | 0o111
-    };
-
-    // Auto-create user home folder: if under /home, use directory name as uid
-    // This assumes /home has inode 2 (the second entry we created in genesis)
-    let home_uid = if parent.0 == 2 { 0 } else { _req.uid() };
-    let home_gid = if parent.0 == 2 { 0 } else { _req.gid() };
+    let perm = if mode == 0 { 0o755 & !umask } else { mode & !umask };
 
     let inode = Node::Directory {
         inode: Inode {
             size: 0,
             nlink: 2,
             permissions: perm,
-            uid: home_uid,
-            gid: home_gid,
+            uid: _req.uid(),
+            gid: _req.gid(),
             created_at: now,
             modified_at: now,
             accessed_at: now,

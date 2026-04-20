@@ -1,5 +1,6 @@
 pub mod fs;
 pub mod helpers;
+pub mod utils;
 
 use crate::helpers::{
     cleanup_unused_chunks, file_setup, is_root, load_metastore, save_metastore,
