@@ -212,9 +212,13 @@ pub fn handle_rmdir(
     }) = store.structure.get_mut(&parent.0)
     {
         entries.remove(&name_str);
-        parent_inode.nlink = parent_inode.nlink.saturating_sub(1);
+        parent_inode.nlink = parent_inode.nlink.checked_sub(1).unwrap_or_else(|| {
+            eprintln!("Warning: directory nlink underflow");
+            0
+        });
         parent_inode.modified_at = now;
         parent_inode.accessed_at = now;
+        parent_inode.created_at = now; // ctime update for directory change
     }
 
     reply.ok();

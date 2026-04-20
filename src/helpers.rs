@@ -134,10 +134,18 @@ pub fn inc_chunk_ref(metastore: &mut MetaStore, hash: Hash) {
 /// Decrement reference count for a chunk, returns true if chunk is no longer referenced
 pub fn dec_chunk_ref(metastore: &mut MetaStore, hash: &Hash) -> bool {
     if let Some(chunk) = metastore.chunks.get_mut(hash) {
-        chunk.nlink = chunk.nlink.saturating_sub(1);
-        if chunk.nlink == 0 {
-            metastore.chunks.remove(hash);
-            return true;
+        let new_nlink = chunk.nlink.checked_sub(1);
+        match new_nlink {
+            Some(n) => {
+                chunk.nlink = n;
+                if n == 0 {
+                    metastore.chunks.remove(hash);
+                    return true;
+                }
+            }
+            None => {
+                eprintln!("Warning: chunk refcount underflow for {:?}", hash);
+            }
         }
     }
     false

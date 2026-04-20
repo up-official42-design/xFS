@@ -49,12 +49,24 @@ pub fn handle_unlink(
     };
 
     let needs_removal = if let Some(Node::File(inode)) = store.structure.get_mut(&ino) {
-        inode.nlink = inode.nlink.saturating_sub(1);
-        if inode.nlink == 0 {
-            true
-        } else {
-            inode.modified_at = now;
-            false
+        // Use checked_sub to detect underflow
+        let new_nlink = inode.nlink.checked_sub(1);
+        match new_nlink {
+            Some(n) => {
+                inode.nlink = n;
+                if n == 0 {
+                    true
+                } else {
+                    inode.modified_at = now;
+                    inode.created_at = now; // Update ctime on nlink change
+                    false
+                }
+            }
+            None => {
+                // Underflow - this indicates a bug
+                eprintln!("Warning: nlink underflow for inode {}", ino);
+                false
+            }
         }
     } else {
         false
@@ -79,6 +91,7 @@ pub fn handle_unlink(
         entries.remove(&name_str);
         parent_inode.modified_at = now;
         parent_inode.accessed_at = now;
+        parent_inode.created_at = now; // ctime update for directory change
     }
 
     reply.ok();
@@ -230,7 +243,10 @@ pub fn handle_rename(
                 inode: np_inode, ..
             }) = store.structure.get_mut(&newparent.0)
         {
-            np_inode.nlink = np_inode.nlink.saturating_sub(1);
+            np_inode.nlink = np_inode.nlink.checked_sub(1).unwrap_or_else(|| {
+                eprintln!("Warning: directory nlink underflow in rename");
+                0
+            });
         }
     }
 
