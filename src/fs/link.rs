@@ -1,18 +1,8 @@
-use crate::helpers::{cleanup_unused_chunks, dec_chunk_ref};
+use crate::helpers::dec_chunk_ref;
+use crate::utils::{get_valid_name, now_ts};
 use crate::{MetaStore, Node};
 use fuser::{Errno, INodeNo, RenameFlags, ReplyData, ReplyEmpty, Request};
-use std::ffi::OsStr;
 use std::sync::{Arc, RwLock};
-
-fn get_valid_name(name: &OsStr) -> Option<String> {
-    name.to_str()
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-}
-
-fn now_ts() -> u64 {
-    chrono::Utc::now().timestamp() as u64
-}
 
 pub fn handle_unlink(
     state: &Arc<RwLock<MetaStore>>,
@@ -63,7 +53,7 @@ pub fn handle_unlink(
         if inode.nlink == 0 {
             true
         } else {
-            inode.created_at = now;
+            inode.modified_at = now;
             false
         }
     } else {
@@ -91,7 +81,6 @@ pub fn handle_unlink(
         parent_inode.accessed_at = now;
     }
 
-    cleanup_unused_chunks(&store);
     reply.ok();
 }
 
@@ -130,7 +119,30 @@ pub fn handle_rename(
         return;
     };
 
-    let replace_info: Option<(u64, bool, Vec<[u8; 32]>)> = {
+    // Check if newparent is a descendant of ino (would create a loop)
+    if let Some(Node::Directory { .. }) = store.structure.get(&ino) {
+        let mut check = newparent.0;
+        loop {
+            if check == ino {
+                reply.error(Errno::EINVAL);
+                return;
+            }
+            if let Some(Node::Directory { entries, .. }) = store.structure.get(&check) {
+                if let Some(&parent_ino) = entries.get("..") {
+                    if parent_ino == check {
+                        break; // reached root
+                    }
+                    check = parent_ino;
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
+    let replace_info: Option<(u64, bool, u32)> = {
         if let Some(Node::Directory { entries, .. }) = store.structure.get(&newparent.0) {
             if let Some(&existing_ino) = entries.get(&newname_str) {
                 if existing_ino != ino {
@@ -144,18 +156,13 @@ pub fn handle_rename(
                                 .filter(|k| *k != "." && *k != "..")
                                 .collect();
                             if non_special.is_empty() {
-                                Some((existing_ino, false, Vec::new()))
+                                Some((existing_ino, false, 0))
                             } else {
                                 None
                             }
                         }
                         Some(Node::File(inode)) => {
-                            let hashes = if inode.nlink > 1 {
-                                None
-                            } else {
-                                Some(inode.chunks.clone())
-                            };
-                            Some((existing_ino, true, hashes.unwrap_or_default()))
+                            Some((existing_ino, true, inode.nlink))
                         }
                         _ => None,
                     }
@@ -173,15 +180,24 @@ pub fn handle_rename(
     let mut target_ino_to_remove: Option<u64> = None;
     let mut target_np_nlink_decr = false;
 
-    if let Some((existing_ino, is_file, chunks)) = &replace_info {
+    if let Some((existing_ino, is_file, nlink)) = &replace_info {
         if *is_file {
-            let hashes: Vec<[u8; 32]> = chunks.to_vec();
-            for hash in hashes {
-                if hash != [0u8; 32] {
-                    dec_chunk_ref(&mut store, &hash);
+            // Only decrement chunk refs and remove from structure if this is the last hardlink
+            if *nlink == 1 {
+                if let Some(Node::File(inode)) = store.structure.get(existing_ino) {
+                    for hash in &inode.chunks {
+                        if *hash != [0u8; 32] {
+                            dec_chunk_ref(&mut store, hash);
+                        }
+                    }
+                }
+                target_ino_to_remove = Some(*existing_ino);
+            } else {
+                // Just decrement the nlink count, don't remove or touch chunks
+                if let Some(Node::File(inode)) = store.structure.get_mut(existing_ino) {
+                    inode.nlink -= 1;
                 }
             }
-            target_ino_to_remove = Some(*existing_ino);
         } else {
             target_ino_to_remove = Some(*existing_ino);
             target_np_nlink_decr = true;
@@ -199,54 +215,51 @@ pub fn handle_rename(
         }
     }
 
-    if let Some(Node::Directory {
-        entries,
-        inode: parent_inode,
-    }) = store.structure.get_mut(&parent.0)
-    {
-        entries.remove(&name_str);
-        parent_inode.modified_at = now;
-        parent_inode.accessed_at = now;
-    }
+    // Handle same-directory rename to avoid double mutable borrow
+    if parent.0 == newparent.0 {
+        if let Some(Node::Directory {
+            entries,
+            inode: parent_inode,
+        }) = store.structure.get_mut(&parent.0)
+        {
+            entries.remove(&name_str);
+            entries.insert(newname_str.clone(), ino);
+            parent_inode.modified_at = now;
+            parent_inode.accessed_at = now;
+        }
+    } else {
+        if let Some(Node::Directory {
+            entries,
+            inode: parent_inode,
+        }) = store.structure.get_mut(&parent.0)
+        {
+            entries.remove(&name_str);
+            parent_inode.modified_at = now;
+            parent_inode.accessed_at = now;
+        }
 
-    if let Some(Node::Directory {
-        entries,
-        inode: parent_inode,
-    }) = store.structure.get_mut(&newparent.0)
-    {
-        entries.insert(newname_str.clone(), ino);
-        parent_inode.modified_at = now;
-        parent_inode.accessed_at = now;
+        if let Some(Node::Directory {
+            entries,
+            inode: parent_inode,
+        }) = store.structure.get_mut(&newparent.0)
+        {
+            entries.insert(newname_str.clone(), ino);
+            parent_inode.modified_at = now;
+            parent_inode.accessed_at = now;
+        }
     }
 
     match store.structure.get_mut(&ino) {
         Some(Node::File(inode)) => {
-            inode.created_at = now;
+            inode.modified_at = now;
         }
         Some(Node::Directory { inode, entries }) => {
-            inode.created_at = now;
-            if parent.0 != newparent.0 {
-                entries.insert("..".to_string(), newparent.0);
-                if let Some(Node::Directory {
-                    inode: old_parent_inode,
-                    ..
-                }) = store.structure.get_mut(&parent.0)
-                {
-                    old_parent_inode.nlink = old_parent_inode.nlink.saturating_sub(1);
-                }
-                if let Some(Node::Directory {
-                    inode: new_parent_inode,
-                    ..
-                }) = store.structure.get_mut(&newparent.0)
-                {
-                    new_parent_inode.nlink = new_parent_inode.nlink.saturating_sub(1);
-                }
-            }
+            inode.modified_at = now;
+            entries.insert("..".to_string(), newparent.0);
         }
         _ => {}
     }
 
-    cleanup_unused_chunks(&store);
     reply.ok();
 }
 
@@ -261,5 +274,75 @@ pub fn handle_readlink(
         reply.data(target.as_bytes());
     } else {
         reply.error(Errno::EINVAL);
+    }
+}
+
+pub fn handle_symlink(
+    state: &Arc<RwLock<MetaStore>>,
+    req: &Request,
+    parent: INodeNo,
+    link_name: &std::ffi::OsStr,
+    target: &std::path::Path,
+    reply: fuser::ReplyEntry,
+) {
+    let Some(name_str) = get_valid_name(link_name) else {
+        reply.error(Errno::EINVAL);
+        return;
+    };
+
+    let target_str = target.to_str().unwrap_or("").to_string();
+
+    let mut store = state.write().unwrap();
+    let now = now_ts();
+
+    if let Some(Node::Directory { entries, .. }) = store.structure.get(&parent.0) {
+        if entries.contains_key(&name_str) {
+            reply.error(Errno::EEXIST);
+            return;
+        }
+    } else {
+        reply.error(Errno::ENOENT);
+        return;
+    }
+
+    let new_ino = store.next_inode;
+    store.next_inode += 1;
+
+    let inode = Node::Symlink {
+        inode: crate::Inode {
+            size: target_str.len() as u64,
+            nlink: 1,
+            permissions: 0o777,
+            uid: req.uid(),
+            gid: req.gid(),
+            created_at: now,
+            modified_at: now,
+            accessed_at: now,
+            chunks: Vec::new(),
+        },
+        target: target_str,
+    };
+
+    store.structure.insert(new_ino, inode);
+
+    if let Some(Node::Directory {
+        entries,
+        inode: parent_inode,
+    }) = store.structure.get_mut(&parent.0)
+    {
+        entries.insert(name_str, new_ino);
+        parent_inode.modified_at = now;
+        parent_inode.accessed_at = now;
+    }
+
+    if let Some(node) = store.structure.get(&new_ino) {
+        use super::attr::make_attr;
+        reply.entry(
+            &super::TTL,
+            &make_attr(fuser::INodeNo(new_ino), node),
+            fuser::Generation(0),
+        );
+    } else {
+        reply.error(Errno::EIO);
     }
 }
