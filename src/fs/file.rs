@@ -5,6 +5,7 @@ use crate::utils::{get_valid_name, now_ts};
 use crate::{Hash, Inode, MetaStore, Node};
 use fuser::{Errno, INodeNo, LockOwner, OpenFlags, ReplyData, ReplyEntry, Request};
 use sha2::{Digest, Sha256};
+use std::ffi::OsStr;
 use std::sync::{Arc, RwLock};
 
 const ZERO_HASH: Hash = [0u8; 32];

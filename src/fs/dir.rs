@@ -4,6 +4,7 @@ use crate::utils::{get_valid_name, now_ts};
 use crate::{Inode, MetaStore, Node};
 use fuser::{Errno, FileType, INodeNo, ReplyDirectory, ReplyEmpty, ReplyEntry, Request};
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::sync::{Arc, RwLock};
 
 pub fn handle_lookup(

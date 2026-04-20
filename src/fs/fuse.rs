@@ -10,7 +10,7 @@ use std::ffi::OsStr;
 use crate::Node;
 use super::dir::{handle_lookup, handle_readdir, handle_mkdir, handle_rmdir};
 use super::file::{handle_read, handle_write, handle_create, handle_mknod};
-use super::link::{handle_unlink, handle_rename};
+use super::link::{handle_unlink, handle_rename, handle_symlink};
 
 pub const TTL: Duration = Duration::from_secs(1);
 
@@ -82,7 +82,7 @@ impl Filesystem for XFS {
         uid: Option<u32>,
         gid: Option<u32>,
         size: Option<u64>,
-        _atime: Option<TimeOrNow>,
+        atime: Option<TimeOrNow>,
         mtime: Option<TimeOrNow>,
         _ctime: Option<std::time::SystemTime>,
         _fh: Option<FileHandle>,
@@ -93,6 +93,7 @@ impl Filesystem for XFS {
         reply: ReplyAttr,
     ) {
         let mut store = self.state.write().unwrap();
+        let now = chrono::Utc::now().timestamp() as u64;
 
         if let Some(node) = store.structure.get_mut(&ino.0) {
             if let Some(new_size) = size && let Node::File(inode) = node {
@@ -100,18 +101,32 @@ impl Filesystem for XFS {
             }
 
             if let Some(mtime_val) = mtime {
-                let now = chrono::Utc::now().timestamp();
                 let mtime_secs: u64 = match mtime_val {
                     TimeOrNow::SpecificTime(t) => t
                         .duration_since(UNIX_EPOCH)
-                        .map(|d| d.as_secs() as i64)
-                        .unwrap_or(now),
+                        .map(|d| d.as_secs())
+                    .unwrap_or(now),
                     TimeOrNow::Now => now,
-                } as u64;
+                };
                 match node {
                     Node::File(inode) => inode.modified_at = mtime_secs,
                     Node::Directory { inode, .. } => inode.modified_at = mtime_secs,
                     Node::Symlink { inode, .. } => inode.modified_at = mtime_secs,
+                }
+            }
+
+            if let Some(atime_val) = atime {
+                let atime_secs: u64 = match atime_val {
+                    TimeOrNow::SpecificTime(t) => t
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                    .unwrap_or(now),
+                    TimeOrNow::Now => now,
+                };
+                match node {
+                    Node::File(inode) => inode.accessed_at = atime_secs,
+                    Node::Directory { inode, .. } => inode.accessed_at = atime_secs,
+                    Node::Symlink { inode, .. } => inode.accessed_at = atime_secs,
                 }
             }
 
@@ -181,6 +196,17 @@ impl Filesystem for XFS {
 
     fn unlink(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         handle_unlink(&self.state, req, parent, name, reply);
+    }
+
+    fn symlink(
+        &self,
+        req: &Request,
+        parent: INodeNo,
+        link_name: &OsStr,
+        target: &std::path::Path,
+        reply: ReplyEntry,
+    ) {
+        handle_symlink(&self.state, req, parent, link_name, target, reply);
     }
 
     fn rmdir(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {

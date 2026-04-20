@@ -1,3 +1,53 @@
+// =============================================================================
+// TECHNICAL DEBT - AI CLEANUP MARKERS
+// =============================================================================
+// 
+// TODO (AI Cleanup): Replace JSON with key-value database
+// Issue: The entire filesystem metadata (meta.json) is loaded as one giant JSON blob.
+// As the filesystem grows, this causes:
+// - Massive latency spikes during mount
+// - Full serialization on every save (hangs FS)
+// - Corruption risk on crash mid-write
+//
+// Proposed fix: Replace serde_json with sled or rocksdb:
+// - Store inodes as individual key-value pairs
+// - Store chunk refs separately  
+// - Implement incremental saves
+// Location: helpers.rs (load_metastore, save_metastore)
+//
+// TODO (AI Cleanup): GC race condition with dirty flag
+// Issue: GC thread runs every 60s and deletes chunks with nlink==0.
+// Race: Between handle_write creating new chunks and GC running, 
+// the GC could delete chunks that are being written.
+//
+// Proposed fix: Add a "dirty" flag or grace period:
+// - Mark chunks as "pending" when written
+// - Only GC chunks that have been "stable" for N seconds
+// - Use atomic reference counting with generation numbers
+// Location: helpers.rs (start_gc_thread, cleanup_unused_chunks)
+//
+// TODO (AI Cleanup): O(N*M) rebuild on every mount
+// Issue: rebuild_chunk_nlink iterates every inode, then every chunk.
+// For large filesystems, mount time becomes unbearable.
+//
+// Proposed fix: Persist refcounts atomically:
+// - Update chunk nlink in the DB when modified
+// - No rebuild needed on startup
+// - Verify consistency on startup instead of rebuilding
+// Location: helpers.rs (rebuild_chunk_nlink)
+//
+// TODO (AI Cleanup): Cache thundering herd
+// Issue: load_chunk drops lock between read and write to cache.
+// Multiple threads can all miss cache, decompress same data, fight to write.
+//
+// Proposed fix: Add request coalescing:
+// - Use a HashMap of "in-flight" load requests
+// - Wait on same request instead of re-executing
+// - Use parking_lot or tokio for async support
+// Location: helpers.rs (load_chunk)
+//
+// =============================================================================
+
 use crate::{Chunk, Hash, MetaStore, Node};
 pub use crate::fs::cache::{create_chunk_cache, SharedChunkCache, ChunkCacheManager, CACHE_SIZE_BYTES};
 use std::collections::HashMap;

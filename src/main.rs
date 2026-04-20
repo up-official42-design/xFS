@@ -1,7 +1,10 @@
 pub mod fs;
 pub mod helpers;
 pub mod utils;
+pub mod types;
+pub mod tracker;
 
+#[allow(legacy_derive_helpers)]
 use crate::helpers::{
     cleanup_unused_chunks, file_setup, is_root, load_metastore, save_metastore,
     set_metastore_for_gc, start_gc_thread,

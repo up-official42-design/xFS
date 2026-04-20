@@ -2,6 +2,7 @@ use crate::helpers::dec_chunk_ref;
 use crate::utils::{get_valid_name, now_ts};
 use crate::{MetaStore, Node};
 use fuser::{Errno, INodeNo, RenameFlags, ReplyData, ReplyEmpty, Request};
+use std::ffi::OsStr;
 use std::sync::{Arc, RwLock};
 
 pub fn handle_unlink(
@@ -163,13 +164,13 @@ pub fn handle_rename(
         })
         .is_some();
 
-    if flags.contains(RenameFlags::NOREPLACE) && target_exists {
+    if flags.contains(RenameFlags::RENAME_NOREPLACE) && target_exists {
         reply.error(Errno::EEXIST);
         return;
     }
 
     // RENAME_EXCHANGE is not supported yet
-    if flags.contains(RenameFlags::EXCHANGE) {
+    if flags.contains(RenameFlags::RENAME_EXCHANGE) {
         reply.error(Errno::ENOSYS);
         return;
     }
@@ -216,12 +217,13 @@ pub fn handle_rename(
         if *is_file {
             // Only decrement chunk refs and remove from structure if this is the last hardlink
             if *nlink == 1 {
-                if let Some(Node::File(inode)) = store.structure.get(existing_ino) {
-                    for hash in &inode.chunks {
-                        if *hash != [0u8; 32] {
-                            dec_chunk_ref(&mut store, hash);
-                        }
-                    }
+                let hashes_to_decr: Vec<_> = if let Some(Node::File(inode)) = store.structure.get(existing_ino) {
+                    inode.chunks.iter().filter(|&&h| h != [0u8; 32]).copied().collect()
+                } else {
+                    vec![]
+                };
+                for hash in hashes_to_decr {
+                    dec_chunk_ref(&mut store, &hash);
                 }
                 target_ino_to_remove = Some(*existing_ino);
             } else {
